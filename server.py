@@ -1,0 +1,237 @@
+import socket
+import threading
+import socket_interact
+from queue import Queue
+from config import *
+
+rooms_cnt = 0
+
+active_users = set()
+get_user_name = dict()
+get_room_no = dict()
+rooms = dict()
+get_client_socket = dict()
+
+print_lock = threading.Lock()
+active_users_lock = threading.Lock()
+get_user_name_lock = threading.Lock()
+get_room_no_lock = threading.Lock()
+rooms_cnt_lock = threading.Lock()
+rooms_lock = threading.Lock()
+get_client_socket_lock = threading.Lock()
+
+
+def main():
+    server = socket_interact.get_server_socket()
+    while True:
+        (client_socket, client_address) = server.accept()
+        with print_lock:
+            print(f">>> Connection established at: {client_address}")
+        th = threading.Thread(target = handle_client_receive, args = (client_socket, client_address), daemon = True)
+        th.start()
+
+
+def handle_client_receive(client_socket, client_address):
+    """
+    - Handles requests from client
+    """
+    while True:
+        p_no, data_sz, file_name_size = socket_interact.receive_header(client_socket)
+        if p_no == "001":
+            user_name = socket_interact.receive_message(client_socket, data_sz)
+            register_client(client_socket, client_address, user_name)
+        elif p_no == "002":
+            desired_room = int(socket_interact.receive_message(client_socket, data_sz))
+            join_other_room(client_socket, client_address, desired_room)
+        elif p_no == "003":
+            disconnect_room(client_socket, client_address)
+        elif p_no == "004":
+            deregister_client(client_socket, client_address)
+        elif p_no == "005":
+            send_room_info(client_socket, client_address)
+        elif p_no == "006":
+            message = socket_interact.receive_message(client_socket, data_sz)
+            send_message(client_socket, client_address, message)
+        elif p_no == "007":
+            message = socket_interact.receive_raw_data(client_socket, data_sz)
+            send_file(client_socket, client_address, file_name_size, message)
+        else:
+            continue
+
+
+def register_client(client_socket, client_address, user_name):
+    """
+    - Registers user_name with server
+        - Maps: client_address -> user_name
+        - Sends "BAD" to client if user_name already exists else room_no of the user
+    """
+    global rooms_cnt
+    with print_lock:
+        print(f">>> {client_address} requested (user-name: {user_name}).")
+    if user_name in active_users:
+        with print_lock:
+            print(f"(user-name: {user_name}) already exists.")
+        socket_interact.send_message(client_socket, 1, "BAD")
+    else:
+        with active_users_lock:
+            active_users.add(user_name)
+        with get_user_name_lock:
+            get_user_name[client_address] = user_name
+        with rooms_cnt_lock:
+            rooms_cnt += 1
+        with rooms_lock:
+            rooms[rooms_cnt] = [client_address]
+        with get_room_no_lock:
+            get_room_no[client_address] = rooms_cnt
+        with get_client_socket_lock:
+            get_client_socket[client_address] = client_socket
+        socket_interact.send_message(client_socket, 1, str(rooms_cnt))
+        with print_lock:
+            print(f"(user-name: {user_name}) registered.")
+    print_vars()
+
+
+def join_other_room(client_socket, client_address, desired_room):
+    """
+    - Changes room of user to desired_room
+        - Sends "BAD" to client if desired_room doesn't exist else "OK"
+    """
+    with print_lock and get_user_name_lock and get_room_no_lock:
+        print(f">>> (user: {get_user_name[client_address]}) requested room change from (room: {get_room_no[client_address]}) to (room: {desired_room}).")
+    if desired_room not in rooms:
+        with print_lock:
+            print(f"(room: {desired_room}) doesn't exists.")
+        socket_interact.send_message(client_socket, 2, f"BAD {desired_room}")
+    else:
+        with get_room_no_lock:
+            prv_room = get_room_no[client_address]
+        if prv_room != desired_room:
+            with rooms_lock:
+                rooms[prv_room].remove(client_address)
+                if len(rooms[prv_room]) == 0:
+                    rooms.pop(prv_room)
+                    try:
+                        rooms[desired_room] += [client_address]
+                    except:
+                        rooms[desired_room] = [client_address] # Loopback (connect to current room)
+            with get_room_no_lock:
+                get_room_no[client_address] = desired_room
+            socket_interact.send_message(client_socket, 2, f"OK {desired_room}")
+        with print_lock and get_user_name_lock:
+            print(f"(user: {get_user_name[client_address]}) moved to (room: {desired_room}).")
+    print_vars()
+
+
+def disconnect_room(client_socket, client_address):
+    """
+    - Disconnects user from current room (with several users)
+        - Moves him to new empty room
+    """
+    global rooms_cnt
+    with print_lock and get_user_name_lock and get_room_no_lock:
+        print(f">>> (user: {get_user_name[client_address]}) requested to disconnect from (room: {get_room_no[client_address]}).")
+    with get_room_no_lock:
+        prv_room = get_room_no[client_address]
+    with rooms_lock:
+        if len(rooms[prv_room]) == 1:
+            with print_lock:
+                print(f"Single user in room. Failed disconnect request.")
+                socket_interact.send_message(client_socket, 3, "BAD")
+                return
+        else:
+            rooms[prv_room].remove(client_address)
+    with rooms_cnt_lock:
+        rooms_cnt += 1
+        new_room = rooms_cnt
+    with rooms_lock:
+        rooms[new_room] = [client_address]
+    with get_room_no_lock:
+        get_room_no[client_address] = new_room
+    socket_interact.send_message(client_socket, 3, str(prv_room) + " " + str(new_room))
+    with print_lock and get_user_name_lock:
+        print(f"(user: {get_user_name[client_address]}) disconnected from (room: {prv_room}) and moved to (room: {new_room}).")
+    print_vars()
+
+
+def deregister_client(client_socket, client_address):
+    """
+    - Deregisters user from server
+    """
+    with print_lock and get_user_name_lock:
+        print(f">>> (user: {get_user_name[client_address]}) requested to quit the application.")
+    with get_user_name_lock:
+        user_name = get_user_name[client_address]
+        get_user_name.pop(client_address)
+    with active_users_lock:
+        active_users.remove(user_name)
+    with get_room_no_lock:
+        room_no = get_room_no[client_address]
+        get_room_no.pop(client_address)
+    with rooms_lock:
+        rooms[room_no].remove(client_address)
+        if len(rooms[room_no]) == 0:
+            rooms.pop(room_no)
+    with print_lock:
+        print(f"(user: {user_name}) closed the application.")
+    print_vars()
+
+
+def send_room_info(client_socket, client_address):
+    """
+    - Sends room info to user
+    """
+    with print_lock and get_user_name_lock:
+        print(f">>> (user: {get_user_name[client_address]}) requested room info.")
+    with get_room_no_lock:
+        room_no = get_room_no[client_address]
+    room_info = []
+    with rooms_lock and get_user_name_lock:
+        for client in rooms[room_no]:
+            room_info += [get_user_name[client]]
+    socket_interact.send_message(client_socket, 5, str(room_no) + " " + " ".join(room_info))
+    print_vars()
+
+
+def send_message(client_socket, client_address, message):
+    """
+    - Sends message to all users in room
+    """
+    with print_lock and get_user_name_lock and get_room_no_lock:
+        print(f">>> (user: {get_user_name[client_address]}) broadcasted a message in (room: {get_room_no[client_address]})")
+    with get_room_no_lock:
+        room_no = get_room_no[client_address]
+    with rooms_lock and get_client_socket_lock:
+        for client in rooms[room_no]:
+            if client == client_address:
+                continue
+            socket_interact.send_message(get_client_socket[client], 6, message)
+    print_vars()
+
+
+def send_file(client_socket, client_address, file_name_size, file_info):
+    """
+    - Sends file to all users in room
+    """
+    with print_lock and get_user_name_lock and get_room_no_lock:
+        print(f">>> (user: {get_user_name[client_address]}) sent a file in (room: {get_room_no[client_address]})")
+    with get_room_no_lock:
+        room_no = get_room_no[client_address]
+    with rooms_lock and get_client_socket_lock:
+        for client in rooms[room_no]:
+            if client == client_address:
+                continue
+            socket_interact.send_message(get_client_socket[client], 7, file_info, file_name_size)
+    print_vars()
+
+
+def print_vars():
+    with print_lock and rooms_cnt_lock and active_users_lock and get_user_name_lock and get_room_no_lock:
+        print(f"rooms_cnt: {rooms_cnt}")
+        print(f"Rooms: {rooms}")
+        print(f"Active users: {active_users}")
+        print(f"get_user_name: {get_user_name}")
+        print(f"get_room_no: {get_room_no}")
+
+
+if __name__ == "__main__":
+    main()
